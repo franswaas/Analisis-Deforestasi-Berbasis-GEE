@@ -1,0 +1,159 @@
+Map.centerObject(roi, 11);
+
+var sen1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+          .filterDate('2024-01-01', '2024-12-31')
+          .filterBounds(roi)
+          .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+          .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+          .filter(ee.Filter.eq('instrumentMode', 'IW'))
+          .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING')) // Orbit bisa DESCENDING/ASCENDING
+          .select('VV', 'VH')
+          .first(); 
+print(sen1);
+
+var sen1_clip = sen1.clip(roi);
+Map.addLayer(sen1_clip.select('VV'), {min: -30, max: 0}, 'VV', 1); // Menampilkan polarisasi VV
+Map.addLayer(sen1_clip.select('VH'), {min: -30, max: 0}, 'VH', 1); // Menampilkan polarisasi VH
+
+// Menampilkan komposit RGB dengan dua polarisasi
+// R: VV, G: 
+var vv_vh_ratio = sen1_clip.select('VV').divide(sen1_clip.select('VH')).rename('VV_VH_Ratio');
+var komposit_rgb = sen1_clip.addBands(vv_vh_ratio)
+                             .select(['VV', 'VH', 'VV_VH_Ratio']);
+var vis_params = {
+  min: [-25, -30, 0.5],    
+  max: [0, -5, 3],        
+  bands: ['VV', 'VH', 'VV_VH_Ratio']
+};
+
+Map.addLayer(komposit_rgb, vis_params, 'RGB');
+
+
+// APLIKASI SAR: DETEKSI DEFORESTASI DENGAN STATISTIK
+
+
+// ------------------------------------------------------------------
+// 2. Fungsi untuk Persiapan Data Sentinel-1
+// ------------------------------------------------------------------
+function prepS1(dateRange) {
+  var s1Image = ee.ImageCollection('COPERNICUS/S1_GRD')
+      .filterBounds(roi)
+      .filterDate(dateRange) 
+      .filter(ee.Filter.eq('instrumentMode', 'IW'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+      .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+      .mean()
+      .clip(roi);
+  return s1Image;
+}
+
+// ------------------------------------------------------------------
+// 3. Membuat Citra SEBELUM dan SESUDAH
+// ------------------------------------------------------------------
+var dateBefore = ee.DateRange('2015-01-01', '2015-12-30'); 
+var imageBefore = prepS1(dateBefore);
+
+var dateAfter = ee.DateRange('2024-01-01', '2024-12-30'); 
+var imageAfter = prepS1(dateAfter);
+
+var vhBefore = imageBefore.select('VH');
+var vhAfter = imageAfter.select('VH');
+
+// ------------------------------------------------------------------
+// 4. Menampilkan Citra 
+// ------------------------------------------------------------------
+var visParamsVH = {min: -25, max: -8}; 
+Map.addLayer(vhBefore, visParamsVH, 'VH (2015 - Sebelum)');
+Map.addLayer(vhAfter, visParamsVH, 'VH (2024 - Sesudah)');
+
+// ------------------------------------------------------------------
+// 5. Membuat Komposit Deteksi Perubahan (RGB)
+// ------------------------------------------------------------------
+var changeComposite = ee.Image.cat(
+  vhBefore, // Channel Merah (Red)
+  vhAfter,  // Channel Hijau (Green)
+  vhBefore  // Channel Biru (Blue)
+);
+var visParamsChange = {
+  min: -25,
+  max: -8,
+  bands: ['VH', 'VH_1', 'VH_2']
+};
+Map.addLayer(changeComposite, visParamsChange, 'Deteksi Perubahan (Magenta = Deforestasi)');
+
+
+// Threshold 1: Area apa yang kita anggap 'hutan' di tahun 2020?
+// Kita anggap area dengan VH > -12dB adalah hutan/vegetasi lebat.
+var forestThreshold = -12;
+var maskForest = vhBefore.gt(forestThreshold);
+
+// Threshold 2: Penurunan 'signifikan' itu seberapa besar?
+// Kita anggap penurunan > 3dB adalah signifikan (untuk menghindari noise)
+var changeThreshold = 3; // dalam dB
+// Hitung perbedaan: (VH 20215) - (VH 2024)
+var vhDifference = vhBefore.subtract(vhAfter);
+var maskChange = vhDifference.gt(changeThreshold);
+
+// Gabungkan kedua mask:
+// Deforestasi = area yg DULU Hutan (maskForest) DAN mengalami perubahan (maskChange)
+var maskDeforestation = maskForest.and(maskChange);
+
+// Tampilkan mask deforestasi di peta
+Map.addLayer(maskDeforestation.selfMask(), 
+             {palette: 'FF0000'}, // Warna merah
+             'Mask Deforestasi (Area Perhitungan)');
+
+// ==================================================================
+// - MENGHITUNG AREA
+// ==================================================================
+
+// 1. Buat gambar area per piksel (dalam meter persegi)
+var pixelArea = ee.Image.pixelArea(); // Area per piksel dlm m^2
+
+// 2. Kalikan area piksel dengan mask kita
+// Hasilnya: gambar di mana piksel deforestasi berisi luas areanya, sisanya 0
+var areaDeforestedImage = pixelArea.updateMask(maskDeforestation);
+
+// 3. Jumlahkan semua nilai area di dalam ROI kita
+var areaStats = areaDeforestedImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 10, // Resolusi Sentinel-1
+  maxPixels: 1e10
+});
+
+// 4. Ambil hasilnya (dalam m^2) dan konversi ke Hektar
+// Perhitungan ini berjalan di server GEE, jadi kita pakai .evaluate()
+areaStats.get('area').evaluate(function(totalAreaMeters) {
+  var totalAreaHectares = ee.Number(totalAreaMeters).divide(10000);
+  
+  // Cetak hasilnya ke Console (di tab sebelah kanan)
+  print('--- STATISTIK AREA DEFORESTASI ---');
+  print('Total Area Terdeteksi (Hektar):', totalAreaHectares);
+});
+
+
+// Gabungkan band yang sudah memiliki nama unik
+var vhHistogramImage = ee.Image.cat(vhBefore, vhAfter);
+
+// Buat Histogram
+var histogram = ui.Chart.image.histogram({
+  image: vhHistogramImage, // Sekarang image ini punya band 'VH (2015)' & 'VH (2024)'
+  region: roi,
+  scale: 100, // Skala 100m 
+  maxPixels: 1e9
+}).setOptions({
+  title: 'Histogram Perubahan VH (2015 vs 2024)', // Judul diperbaiki
+  vAxis: {title: 'Jumlah Piksel'},
+  hAxis: {title: 'Nilai Backscatter VH (dB)'},
+  colors: ['#FF0000', '#00FF00'], // 2015 (Merah), 2024 (Hijau)
+  series: {
+    0: {lineWidth: 2},
+    1: {lineWidth: 2}
+  }
+});
+
+// Tampilkan chart di Console
+print('--- STATISTIK VISUAL ---');
+print(histogram);
